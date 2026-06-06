@@ -9,7 +9,10 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # GHCR requires lowercase image refs; ${{ github.repository }} preserves
+  # the org casing (Traimeta/oikb) which is rejected by buildx. Hardcoding
+  # the lowercase form here is the simplest fix.
+  IMAGE_NAME: traimeta/oikb
 
 jobs:
   build:
