@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import httpx
@@ -136,3 +137,32 @@ class OikbClient:
         resp.raise_for_status()
         data = resp.json()
         return data.get("files", [])
+
+    def present_filenames(self, kb_id: str, window_s: float = 900.0) -> set[str]:
+        """Filenames already in this KB, or uploaded-but-not-yet-linked (in-flight).
+
+        Guards against duplicate uploads: OWUI's /sync/diff does NOT count a
+        still-processing upload as present, so an overlapping sync (a manual run
+        during a daemon cycle, or a file that takes longer to embed than the
+        sync interval) would re-add it. A filename is considered present if a
+        file with that name is linked to this KB, or was created within
+        ``window_s`` and is not yet assigned to a collection (pending link).
+        """
+        resp = self._http.get("/files/")
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("items", data) if isinstance(data, dict) else data
+        now = time.time()
+        names: set[str] = set()
+        for f in items or []:
+            meta = f.get("meta") or {}
+            name = meta.get("name")
+            if not name:
+                continue
+            coll = meta.get("collection_name")
+            created = f.get("created_at") or 0
+            if coll == kb_id:
+                names.add(name)
+            elif (coll is None or str(coll).startswith("file-")) and (now - created) <= window_s:
+                names.add(name)
+        return names

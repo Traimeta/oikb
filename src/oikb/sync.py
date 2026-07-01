@@ -158,6 +158,18 @@ def run_sync(
         connector.close()
 
 
+def _filter_already_present(
+    added: list[dict[str, Any]], present: set[str]
+) -> tuple[list[dict[str, Any]], int]:
+    """Drop 'added' entries whose filename is already present or in-flight in
+    the KB (idempotency guard against overlapping syncs).
+
+    Returns (kept, skipped_count).
+    """
+    kept = [a for a in added if a.get("filename") not in present]
+    return kept, len(added) - len(kept)
+
+
 def _run_sync_inner(
     client: OikbClient,
     connector: BaseConnector,
@@ -215,6 +227,25 @@ def _run_sync_inner(
     directory_map: dict[str, str] = diff.get("directory_map", {})
 
     result.unmodified = unmodified_count
+
+    # Idempotency guard: OWUI's /sync/diff marks a still-processing upload as
+    # "added", so an overlapping sync (a manual run during a daemon cycle, or a
+    # file slower to embed than the sync interval) re-uploads it → duplicate KB
+    # entries. Skip filenames already present or in-flight. Best-effort — a
+    # lookup failure must never block the sync.
+    if added:
+        try:
+            present = client.present_filenames(kb_id)
+        except Exception:  # noqa: BLE001
+            present = set()
+        added, skipped_present = _filter_already_present(added, present)
+        if skipped_present:
+            result.unmodified += skipped_present
+            if verbose:
+                click.echo(
+                    f"  Skipping {skipped_present} file(s) already present or in-flight",
+                    err=True,
+                )
 
     if show_progress:
         parts = []
