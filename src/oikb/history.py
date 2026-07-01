@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -42,10 +43,15 @@ class SyncHistory:
         self.db_path = db_path or _DEFAULT_DB
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: sqlite3.Connection | None = None
+        # The daemon logs syncs from asyncio.to_thread() worker threads, so the
+        # cached connection is reused across threads. Open it with
+        # check_same_thread=False and serialise every access with this lock so
+        # SQLite writes stay safe. See tests/test_history_threadsafety.py.
+        self._lock = threading.Lock()
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self.db_path))
+            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._conn.executescript(_SCHEMA)
         return self._conn
@@ -65,30 +71,31 @@ class SyncHistory:
         """Record a sync result."""
         now = time.time()
         duration_ms = int((now - started_at) * 1000)
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO sync_log
-               (id, source, kb_id, status, started_at, finished_at,
-                duration_ms, files_added, files_modified, files_deleted,
-                unmodified, error_message, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                str(uuid.uuid4()),
-                source,
-                kb_id,
-                status,
-                started_at,
-                now,
-                duration_ms,
-                files_added,
-                files_modified,
-                files_deleted,
-                unmodified,
-                error,
-                now,
-            ),
-        )
-        conn.commit()
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                """INSERT INTO sync_log
+                   (id, source, kb_id, status, started_at, finished_at,
+                    duration_ms, files_added, files_modified, files_deleted,
+                    unmodified, error_message, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()),
+                    source,
+                    kb_id,
+                    status,
+                    started_at,
+                    now,
+                    duration_ms,
+                    files_added,
+                    files_modified,
+                    files_deleted,
+                    unmodified,
+                    error,
+                    now,
+                ),
+            )
+            conn.commit()
 
     def query(
         self,
@@ -97,7 +104,6 @@ class SyncHistory:
         errors_only: bool = False,
     ) -> list[dict[str, Any]]:
         """Retrieve recent sync log entries."""
-        conn = self._get_conn()
         sql = "SELECT * FROM sync_log WHERE 1=1"
         params: list[Any] = []
 
@@ -110,29 +116,34 @@ class SyncHistory:
         sql += " ORDER BY started_at DESC LIMIT ?"
         params.append(limit)
 
-        rows = conn.execute(sql, params).fetchall()
+        with self._lock:
+            conn = self._get_conn()
+            rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
     def last_sync(self, source: str) -> dict[str, Any] | None:
         """Get the most recent sync entry for a source."""
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT * FROM sync_log WHERE source = ? ORDER BY started_at DESC LIMIT 1",
-            (source,),
-        ).fetchone()
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT * FROM sync_log WHERE source = ? ORDER BY started_at DESC LIMIT 1",
+                (source,),
+            ).fetchone()
         return dict(row) if row else None
 
     def clear(self, older_than_days: int = 30) -> int:
         """Prune entries older than N days. Returns count deleted."""
-        conn = self._get_conn()
         cutoff = time.time() - (older_than_days * 86400)
-        cursor = conn.execute(
-            "DELETE FROM sync_log WHERE created_at < ?", (cutoff,)
-        )
-        conn.commit()
-        return cursor.rowcount
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.execute(
+                "DELETE FROM sync_log WHERE created_at < ?", (cutoff,)
+            )
+            conn.commit()
+            return cursor.rowcount
 
     def close(self) -> None:
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        with self._lock:
+            if self._conn:
+                self._conn.close()
+                self._conn = None
